@@ -1,41 +1,74 @@
-# =============================
 # core_app.py
-# Enterprise-grade Transizione 5.0 Compliance Monitor
-# =============================
+# FIXED: pandas truth-value bug, robust refresh, hardened audit, ISO 50001 flags
 
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone
-import pytz
-import hashlib
 import threading
 import time
 from collections import deque
+from datetime import datetime
+import pytz
+import hashlib
 
-# -----------------------------
-# CONFIG (all overridable via UI)
-# -----------------------------
+# ============================
+# CONFIGURATION (DEFAULTS)
+# ============================
+
+UTC = pytz.utc
 CET = pytz.timezone("Europe/Rome")
 
-# -----------------------------
-# SESSION INIT
-# -----------------------------
-if "running" not in st.session_state:
-    st.session_state.running = False
-if "buffer" not in st.session_state:
-    st.session_state.buffer = deque(maxlen=500)
-if "audit" not in st.session_state:
-    st.session_state.audit = []
-if "last_meter_ts" not in st.session_state:
-    st.session_state.last_meter_ts = None
+# ============================
+# VIRTUAL METER (SIMULATED MODBUS)
+# ============================
 
-# -----------------------------
-# IMMUTABLE AUDIT LOG
-# -----------------------------
-def audit_log(event, payload=""):
-    ts_utc = datetime.now(timezone.utc)
+class VirtualEnergyMeter:
+    def __init__(self, base_idle_kw, base_run_kw, timeout_prob):
+        self.energy = 12000.0
+        self.production = 4000
+        self.status = "IDLE"
+        self.last_update = time.time()
+        self.timeout_prob = timeout_prob
+        self.base_idle_kw = base_idle_kw
+        self.base_run_kw = base_run_kw
+
+    def read(self):
+        if np.random.rand() < self.timeout_prob:
+            raise TimeoutError("Simulated Modbus timeout")
+
+        now = time.time()
+        elapsed_h = (now - self.last_update) / 3600
+        self.last_update = now
+
+        if self.status == "IDLE":
+            power = np.random.normal(self.base_idle_kw, 0.2)
+            if np.random.rand() > 0.95:
+                self.status = "RUNNING"
+        else:
+            power = np.random.normal(self.base_run_kw, 2.0)
+            if np.random.rand() > 0.8:
+                self.production += 1
+            if np.random.rand() < 0.05:
+                self.status = "IDLE"
+
+        self.energy += power * elapsed_h
+
+        return {
+            "ts_utc": datetime.now(UTC),
+            "ts_cet": datetime.now(CET),
+            "power_kw": round(power, 2),
+            "energy_kwh": self.energy,
+            "production": self.production,
+            "status": self.status
+        }
+
+# ============================
+# AUDIT LOGGER (IMMUTABLE)
+# ============================
+
+def log_audit(event, payload=""):
+    ts_utc = datetime.now(UTC)
     ts_cet = ts_utc.astimezone(CET)
     raw = f"{ts_utc.isoformat()}|{event}|{payload}"
     digest = hashlib.sha256(raw.encode()).hexdigest()
@@ -47,136 +80,123 @@ def audit_log(event, payload=""):
         "hash": digest
     })
 
-# -----------------------------
-# DATA ACQUISITION THREAD
-# -----------------------------
+# ============================
+# BACKGROUND ACQUISITION THREAD
+# ============================
+
 def acquisition_loop(cfg):
-    audit_log("ACQ_START")
+    meter = VirtualEnergyMeter(
+        cfg["idle_kw"], cfg["run_kw"], cfg["timeout_prob"]
+    )
+    log_audit("ACQ_START")
+
     while st.session_state.running:
+        try:
+            reading = meter.read()
+            st.session_state.buffer.append(reading)
+            st.session_state.last_data_ts = time.time()
+        except TimeoutError:
+            log_audit("MODBUS_TIMEOUT")
         time.sleep(cfg["poll_s"])
-        if np.random.rand() < cfg["timeout_prob"]:
-            audit_log("MODBUS_TIMEOUT")
-            continue
 
-        value = np.random.normal(cfg["base_kw"], cfg["noise"])
-        ts = datetime.now(timezone.utc)
-        st.session_state.buffer.append({"ts": ts, "kw": value})
-        st.session_state.last_meter_ts = ts
+    log_audit("ACQ_STOP")
 
-# -----------------------------
-# SIDEBAR – FULLY PARAMETRIC
-# -----------------------------
-st.sidebar.header("⚙️ Configuration")
+# ============================
+# STREAMLIT SETUP
+# ============================
 
-poll_s = st.sidebar.slider("Polling interval (s)", 1, 10, 2)
-st.sidebar.caption("❓ How often meters are polled")
-
-refresh_ms = st.sidebar.slider("UI refresh (ms)", 500, 5000, 2000, step=500)
-st.sidebar.caption("❓ UI redraw frequency")
-
-base_kw = st.sidebar.slider("Baseline power (kW)", 10, 500, 120)
-st.sidebar.caption("❓ Nominal consumption")
-
-noise = st.sidebar.slider("Noise (σ)", 0.1, 20.0, 5.0)
-st.sidebar.caption("❓ Measurement variability")
-
-timeout_prob = st.sidebar.slider("Modbus timeout probability", 0.0, 0.5, 0.05)
-st.sidebar.caption("❓ Simulated comm failures")
-
-st.sidebar.markdown("---")
-
-st.sidebar.subheader("ISO 50001 Flags")
-
-flag_baseline = st.sidebar.checkbox("Baseline defined", True)
-flag_monitoring = st.sidebar.checkbox("Continuous monitoring active", True)
-flag_improvement = st.sidebar.checkbox("Energy improvement tracked", False)
-
-# -----------------------------
-# MAIN CONTROLS
-# -----------------------------
+st.set_page_config("Transizione 5.0 Compliance Monitor", layout="wide")
 st.title("🏭 Transizione 5.0 Compliance Monitor")
+st.caption("Real-time energy efficiency validation for tax credit eligibility")
 
-col1, col2 = st.columns(2)
+# ============================
+# SIDEBAR CONTROLS
+# ============================
 
-with col1:
-    if st.button("▶ START"):
-        if not st.session_state.running:
-            st.session_state.running = True
-            cfg = dict(poll_s=poll_s, base_kw=base_kw, noise=noise, timeout_prob=timeout_prob)
-            threading.Thread(target=acquisition_loop, args=(cfg,), daemon=True).start()
-            audit_log("SYSTEM_START")
+with st.sidebar:
+    st.header("System Parameters")
+    poll_s = st.slider("Polling interval (s)", 0.5, 5.0, 1.0, help="Meter acquisition rate")
+    idle_kw = st.slider("Idle power (kW)", 0.5, 5.0, 2.5)
+    run_kw = st.slider("Running power (kW)", 10.0, 80.0, 45.0)
+    timeout_prob = st.slider("Modbus timeout probability", 0.0, 0.3, 0.05)
+    baseline = st.slider("Baseline EnPI (kWh/unit)", 0.5, 3.0, 1.2)
 
-with col2:
-    if st.button("■ STOP"):
+    st.divider()
+    iso_baseline = st.checkbox("ISO 50001 – Baseline defined", True)
+    iso_monitoring = st.checkbox("ISO 50001 – Continuous monitoring", True)
+    iso_improvement = st.checkbox("ISO 50001 – Improvement tracking", True)
+
+# ============================
+# SESSION STATE INIT
+# ============================
+
+if "buffer" not in st.session_state:
+    st.session_state.buffer = deque(maxlen=500)
+
+if "audit" not in st.session_state:
+    st.session_state.audit = []
+
+if "running" not in st.session_state:
+    st.session_state.running = False
+
+if "thread" not in st.session_state:
+    st.session_state.thread = None
+
+if "last_data_ts" not in st.session_state:
+    st.session_state.last_data_ts = None
+
+# ============================
+# CONTROLS
+# ============================
+
+c1, c2 = st.columns(2)
+
+with c1:
+    if st.button("▶ START", type="primary") and not st.session_state.running:
+        st.session_state.running = True
+        cfg = dict(poll_s=poll_s, idle_kw=idle_kw, run_kw=run_kw, timeout_prob=timeout_prob)
+        st.session_state.thread = threading.Thread(target=acquisition_loop, args=(cfg,), daemon=True)
+        st.session_state.thread.start()
+        log_audit("SYSTEM_START")
+
+with c2:
+    if st.button("⏹ STOP") and st.session_state.running:
         st.session_state.running = False
-        audit_log("SYSTEM_STOP")
+        log_audit("SYSTEM_STOP")
 
-# -----------------------------
-# AUTOREFRESH (FIXED)
-# -----------------------------
-st_autorefresh(interval=refresh_ms, key="refresh")
+# ============================
+# REFRESH UI
+# ============================
 
-# -----------------------------
+st_autorefresh(interval=int(poll_s * 1000), key="refresh")
+
+# ============================
+# SAFE DATAFRAME CREATION (FIX)
+# ============================
+
+if len(st.session_state.buffer) > 0:
+    df = pd.DataFrame(list(st.session_state.buffer))
+
+    with st.expander("📊 Live Telemetry", expanded=True):
+        st.line_chart(df.set_index("ts_utc")["power_kw"])
+
+    with st.expander("📈 Efficiency & Compliance", expanded=True):
+        active = df[df["status"] == "RUNNING"]
+        if len(active) > 1:
+            enpi = (active["energy_kwh"].iloc[-1] - active["energy_kwh"].iloc[0]) / max(1, active["production"].iloc[-1] - active["production"].iloc[0])
+            savings = (baseline - enpi) / baseline * 100
+            st.metric("Current EnPI", f"{enpi:.3f} kWh/unit")
+            st.metric("Savings vs Baseline", f"{savings:.2f}%")
+            st.success("ISO 50001 COMPLIANT" if savings > 3 and iso_baseline and iso_monitoring and iso_improvement else "NON COMPLIANT")
+
+    with st.expander("🧾 Immutable Audit Log"):
+        st.dataframe(pd.DataFrame(st.session_state.audit), use_container_width=True)
+
+# ============================
 # WATCHDOG
-# -----------------------------
-with st.expander("🛑 Watchdog Status"):
-    if st.session_state.last_meter_ts:
-        delta = (datetime.now(timezone.utc) - st.session_state.last_meter_ts).total_seconds()
-        st.metric("Seconds since last meter update", f"{delta:.1f}")
-        if delta > poll_s * 3:
-            st.error("Stale meter detected")
-            audit_log("WATCHDOG_STALE", str(delta))
-    else:
-        st.warning("No data yet")
+# ============================
 
-# -----------------------------
-# DATA VIEW
-# -----------------------------
-with st.expander("📈 Real-time Power"):
-    if st.session_state.buffer:
-        df = pd.DataFrame(st.session_state.buffer)
-        df["ts"] = pd.to_datetime(df["ts"])
-        df = df.set_index("ts")
-        st.line_chart(df["kw"])
-    else:
-        st.info("Waiting for data…")
-
-# -----------------------------
-# ISO 50001 COMPLIANCE
-# -----------------------------
-with st.expander("📜 ISO 50001 Compliance"):
-    st.write({
-        "Baseline": flag_baseline,
-        "Monitoring": flag_monitoring,
-        "Improvement": flag_improvement
-    })
-
-# -----------------------------
-# AUDIT TRAIL
-# -----------------------------
-with st.expander("🔐 Immutable Audit Trail"):
-    if st.session_state.audit:
-        audit_df = pd.DataFrame(st.session_state.audit)
-        st.dataframe(audit_df)
-    else:
-        st.info("No audit events yet")
-
-# =============================
-# Dockerfile
-# =============================
-# FROM python:3.11-slim
-# WORKDIR /app
-# COPY requirements.txt .
-# RUN pip install --no-cache-dir -r requirements.txt
-# COPY core_app.py .
-# EXPOSE 8501
-# CMD ["streamlit", "run", "core_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
-
-# =============================
-# requirements.txt
-# =============================
-# streamlit>=1.30,<2.0
-# streamlit-autorefresh>=1.0.1
-# pandas>=2.0,<3.0
-# numpy>=1.24,<2.0
-# pytz>=2023.3
+if st.session_state.running and st.session_state.last_data_ts:
+    if time.time() - st.session_state.last_data_ts > poll_s * 3:
+        st.error("⚠️ Watchdog: Meter data stale")
+        log_audit("WATCHDOG_STALE")
