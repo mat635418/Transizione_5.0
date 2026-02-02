@@ -152,12 +152,18 @@ if "last_data_ts" not in st.session_state:
 c1, c2 = st.columns(2)
 
 with c1:
-    if st.button("▶ START", type="primary") and not st.session_state.running:
-        st.session_state.running = True
-        cfg = dict(poll_s=poll_s, idle_kw=idle_kw, run_kw=run_kw, timeout_prob=timeout_prob)
-        st.session_state.thread = threading.Thread(target=acquisition_loop, args=(cfg,), daemon=True)
-        st.session_state.thread.start()
-        log_audit("SYSTEM_START")
+    if st.button("▶ START", type="primary"):
+        if not st.session_state.running:
+            st.session_state.running = True
+            cfg = dict(poll_s=poll_s, idle_kw=idle_kw, run_kw=run_kw, timeout_prob=timeout_prob)
+            st.session_state.thread = threading.Thread(
+                target=acquisition_loop,
+                args=(cfg,),
+                daemon=True
+            )
+            st.session_state.thread.start()
+            log_audit("SYSTEM_START")
+            st.experimental_rerun()
 
 with c2:
     if st.button("⏹ STOP") and st.session_state.running:
